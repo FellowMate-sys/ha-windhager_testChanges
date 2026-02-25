@@ -1,0 +1,105 @@
+{
+  "eco_default_duration_minutes": 180,
+  "unknown_values": ["-.-", ""],
+
+  "heating_circuits": [
+    {
+      "name": "Parterre/WW",
+      "node": 15,
+      "fct": 0,
+      "oids": {
+        "mode": "/1/15/0/96/0/0",
+        "comfort_offset": "/1/15/0/97/0/0",
+        "eco_duration": "/1/15/0/99/0/0",
+        "eco_temp": "/1/15/0/99/1/0",
+        "room_temp": "/1/15/0/113/0/0",
+        "room_target_ro": "/1/15/0/113/1/0",
+        "flow_temp": "/1/15/0/116/0/0",
+        "flow_target": "/1/15/0/116/1/0",
+        "pump": "/1/15/0/122/0/0",
+        "mixer": "/1/15/0/122/1/0",
+        "dhw_temp": "/1/15/0/114/0/0",
+        "dhw_target_ro": "/1/15/0/114/1/0",
+        "outside_temp": "/1/15/0/0/0/0"
+      }
+    },
+    {
+      "name": "OG 1",
+      "node": 15,
+      "fct": 1,
+      "oids": {
+        "mode": "/1/15/1/96/0/0",
+        "comfort_offset": "/1/15/1/97/0/0",
+        "eco_duration": "/1/15/1/99/0/0",
+        "eco_temp": "/1/15/1/99/1/0",
+        "room_temp": "/1/15/1/113/0/0",
+        "room_target_ro": "/1/15/1/113/1/0",
+        "flow_temp": "/1/15/1/116/0/0",
+        "flow_target": "/1/15/1/116/1/0",
+        "pump": "/1/15/1/122/0/0",
+        "mixer": "/1/15/1/122/1/0",
+        "dhw_temp": "/1/15/1/114/0/0",
+        "dhw_target_ro": "/1/15/1/114/1/0",
+        "outside_temp": "/1/15/1/0/0/0"
+      }
+    },
+    {
+      "name": "Fussboden",
+      "node": 17,
+      "fct": 0,
+      "oids": {
+        "mode": "/1/17/0/96/0/0",
+        "comfort_offset": "/1/17/0/97/0/0",
+        "eco_duration": "/1/17/0/99/0/0",
+        "eco_temp": "/1/17/0/99/1/0",
+        "room_temp": "/1/17/0/113/0/0",
+        "room_target_ro": "/1/17/0/113/1/0",
+        "flow_temp": "/1/17/0/116/0/0",
+        "flow_target": "/1/17/0/116/1/0",
+        "pump": "/1/17/0/122/0/0",
+        "mixer": "/1/17/0/122/1/0",
+        "dhw_temp": "/1/17/0/114/0/0",
+        "dhw_target_ro": "/1/17/0/114/1/0",
+        "outside_temp": "/1/17/0/0/0/0"
+      }
+    }
+  ],
+
+  "modules": [
+    {
+      "name": "AeroWIN",
+      "node": 60,
+      "fct": 1,
+      "sensors": [
+        { "name": "Alarmcode",                "oid": "/1/60/1/97/0/0" },
+        { "name": "Aktuelle Leistung",        "oid": "/1/60/1/98/2/0" },
+        { "name": "COP aktuell",              "oid": "/1/60/1/98/3/0" },
+        { "name": "Vorlauftemperatur Soll",   "oid": "/1/60/1/103/1/0" },
+        { "name": "Aktuelle Leistungsabgabe", "oid": "/1/60/1/100/6/0" }
+      ]
+    },
+    {
+      "name": "Hybrid",
+      "node": 60,
+      "fct": 2,
+      "sensors": [
+        { "name": "Außentemperatur",          "oid": "/1/60/2/98/3/0" }
+      ]
+    },
+    {
+      "name": "LogWIN",
+      "node": 65,
+      "fct": 0,
+      "sensors": [
+        { "name": "Alarmcode",                "oid": "/1/65/0/155/3/0" },
+        { "name": "Kesseltemperatur Ist",     "oid": "/1/65/0/155/2/0" },
+        { "name": "Betriebsphase",            "oid": "/1/65/0/155/1/0" },
+        { "name": "Puffertemperatur Oben",    "oid": "/1/65/0/156/2/0" },
+        { "name": "Puffertemperatur Mitte",   "oid": "/1/65/0/156/4/0" },
+        { "name": "Puffertemperatur Unten",   "oid": "/1/65/0/156/3/0" },
+        { "name": "Pufferbeladegrad",         "oid": "/1/65/0/156/8/0" },
+        { "name": "Brennkammertemperatur",    "oid": "/1/65/0/156/7/0" }
+      ]
+    }
+  ]
+}

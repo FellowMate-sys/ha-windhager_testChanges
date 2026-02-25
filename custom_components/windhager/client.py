@@ -1,414 +1,239 @@
 import aiohttp
+import json
 import logging
+from pathlib import Path
 from .aiohelper import DigestAuth
-from .const import DEFAULT_USERNAME, CLIMATE_FUNCTION_TYPE, HEATER_FUNCTION_TYPE
+from .const import DEFAULT_USERNAME, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class WindhagerHttpClient:
-    """Raw API HTTP requests"""
+    """HTTP client for the RC7030 API, fully driven by spec.json."""
 
     def __init__(self, host, password) -> None:
         self.host = host
         self.password = password
-        self.oids = None
-        self.devices = []
+
         self._session = None
         self._auth = None
 
+        # Loaded on init from spec.json
+        self._spec = self._load_spec()
+        self._unknown_values = set(self._spec.get("unknown_values", ["-.-", ""]))
+        # Runtime-default Eco/Comfort duration (editable via service)
+        self._eco_default_duration_minutes = int(
+            self._spec.get("eco_default_duration_minutes", 180)
+        )
+
+        # These are rebuilt on each fetch_all
+        self._oids_to_fetch = set()
+        self.devices = []
+
+    # ---------------------- Public properties ----------------------
+
+    @property
+    def eco_default_duration_minutes(self) -> int:
+        """Default Eco/Comfort duration used by climate set_temperature."""
+        return self._eco_default_duration_minutes
+
+    def set_eco_default_duration_minutes(self, minutes: int) -> None:
+        """Update the runtime default Eco/Comfort duration (service can call this)."""
+        try:
+            minutes = int(minutes)
+            if minutes <= 0:
+                raise ValueError
+            self._eco_default_duration_minutes = minutes
+            _LOGGER.info("Eco/Comfort default duration set to %s minutes", minutes)
+        except Exception:
+            _LOGGER.error("Invalid Eco/Comfort default duration: %s", minutes)
+
+    # ---------------------- Internal helpers ----------------------
+
+    def _load_spec(self) -> dict:
+        """Load spec.json located next to this file."""
+        try:
+            path = Path(__file__).with_name("spec.json")
+            with path.open("r", encoding="utf-8") as f:
+                spec = json.load(f)
+            _LOGGER.debug("Loaded spec.json from %s", path)
+            return spec
+        except Exception as e:
+            _LOGGER.error("Failed to load spec.json: %s", e)
+            # Fallback to empty spec so HA stays alive
+            return {"heating_circuits": [], "modules": []}
+
     async def _ensure_session(self):
-        """Ensure that we have an active client session"""
         if self._session is None:
             self._session = aiohttp.ClientSession()
             self._auth = DigestAuth(DEFAULT_USERNAME, self.password, self._session)
 
     async def close(self):
-        """Close the client session"""
         if self._session:
             await self._session.close()
             self._session = None
             self._auth = None
 
-    async def fetch(self, url):
+    async def _lookup(self, oid: str):
+        """GET /api/1.0/lookup<oid>"""
+        await self._ensure_session()
+        url = f"http://{self.host}/api/1.0/lookup{oid}"
         try:
-            await self._ensure_session()
-            ret = await self._auth.request(
-                "GET", f"http://{self.host}/api/1.0/lookup{url}"
-            )
-            json = await ret.json()
-            _LOGGER.debug("Fetched data for %s: %s", url, json)
-            return json
+            ret = await self._auth.request("GET", url)
+            js = await ret.json()
+            _LOGGER.debug("Lookup %s -> %s", oid, js)
+            return js
         except Exception as e:
-            _LOGGER.error("Failed to fetch data for %s: %s", url, str(e))
+            _LOGGER.error("Lookup failed for %s: %s", oid, e)
+            return None
+
+    async def update(self, oid: str, value):
+        """PUT /api/1.0/datapoint"""
+        await self._ensure_session()
+        payload = bytes(f'{{"OID":"{oid}","value":"{value}"}}', "utf-8")
+        try:
+            await self._auth.request("PUT", f"http://{self.host}/api/1.0/datapoint", data=payload)
+            _LOGGER.debug("PUT %s = %s", oid, value)
+        except Exception as e:
+            _LOGGER.error("Failed to update %s: %s", oid, e)
             raise
 
-    async def update(self, oid, value):
-        await self._ensure_session()
-        await self._auth.request(
-            "PUT",
-            f"http://{self.host}/api/1.0/datapoint",
-            data=bytes(f'{{"OID":"{oid}","value":"{value}"}}', "utf-8"),
-        )
-
     @staticmethod
-    def slugify(identifier_str):
+    def slugify(identifier_str: str) -> str:
         return identifier_str.replace(".", "-").replace("/", "-")
 
+    # ---------------------- Device builders ----------------------
+
+    def _build_hk_climate_device(self, hk: dict):
+        """Create a climate device (and child sensors) from a HK spec block."""
+        name = hk["name"]
+        node = hk["node"]
+        fct = hk["fct"]
+        oids = hk["oids"]
+
+        prefix = f"/1/{node}/{fct}"
+        dev_id = self.slugify(f"{self.host}{prefix}")
+
+        # Parent climate device
+        self.devices.append({
+            "id": dev_id,
+            "name": name,
+            "type": "climate",
+            "prefix": prefix,  # kept for backward compatibility
+            # Explicit, semantic OIDs used by climate.py
+            "oids_map": {
+                "mode": oids.get("mode"),
+                "comfort_offset": oids.get("comfort_offset"),
+                "eco_temp": oids.get("eco_temp"),
+                "eco_duration": oids.get("eco_duration"),
+                "room_temp": oids.get("room_temp"),
+                "room_target_ro": oids.get("room_target_ro")
+            },
+            "device_id": dev_id,
+            "device_name": name,
+        })
+
+        # Register control/read OIDs
+        for k in ("mode", "comfort_offset", "eco_temp", "eco_duration", "room_temp", "room_target_ro"):
+            if oids.get(k):
+                self._oids_to_fetch.add(oids[k])
+
+        # Temperature child sensors
+        for key, nice in [
+            ("room_temp", f"{name} Room Temperature"),
+            ("room_target_ro", f"{name} Target Temperature (read-only)"),
+            ("flow_temp", f"{name} Flow Temperature"),
+            ("flow_target", f"{name} Flow Target"),
+            ("dhw_temp", f"{name} DHW Temperature"),
+            ("dhw_target_ro", f"{name} DHW Target (read-only)"),
+            ("outside_temp", f"{name} Outside Temperature"),
+        ]:
+            oid = oids.get(key)
+            if oid:
+                self.devices.append({
+                    "id": self.slugify(f"{self.host}{oid}"),
+                    "name": nice,
+                    "type": "temperature",
+                    "oid": oid,
+                    "device_id": dev_id,
+                    "device_name": name,
+                })
+                self._oids_to_fetch.add(oid)
+
+        # Status sensors (non-temperature)
+        for key, nice in [
+            ("pump", f"{name} Pump"),
+            ("mixer", f"{name} Mixer"),
+        ]:
+            oid = oids.get(key)
+            if oid:
+                self.devices.append({
+                    "id": self.slugify(f"{self.host}{oid}"),
+                    "name": nice,
+                    "type": "sensor",
+                    "device_class": None,
+                    "state_class": None,
+                    "unit": None,
+                    "oid": oid,
+                    "device_id": dev_id,
+                    "device_name": name,
+                })
+                self._oids_to_fetch.add(oid)
+
+    def _build_module_sensors(self, module: dict):
+        """Create a non-climate device (AeroWIN / LogWIN / Hybrid) with read-only sensors."""
+        name = module["name"]
+        node = module["node"]
+        fct  = module["fct"]
+        prefix = f"/1/{node}/{fct}"
+        dev_id = self.slugify(f"{self.host}{prefix}")
+
+        for s in module.get("sensors", []):
+            oid = s["oid"]
+            s_name = s["name"]
+            # Heuristic: label as temperature if name contains "temperatur"
+            typ = "temperature" if "temperatur" in s_name.lower() else "sensor"
+            self.devices.append({
+                "id": self.slugify(f"{self.host}{oid}"),
+                "name": f"{name} {s_name}",
+                "type": typ,
+                "oid": oid,
+                "device_id": dev_id,
+                "device_name": name,
+            })
+            self._oids_to_fetch.add(oid)
+
+    # ---------------------- Main entry for coordinator ----------------------
+
     async def fetch_all(self):
-        if self.oids is None:
-            self.oids = set()
-            # Fetch all devices on the network
-            json_devices = await self.fetch("/1")
+        """Build device list from spec.json and fetch all referenced OIDs once."""
+        # Reset per-cycle
+        self.devices = []
+        self._oids_to_fetch = set()
 
-            # Add devices
-            for device in json_devices:
-                device_id = f"/1/{str(device['nodeId'])}"
+        # Build from spec (no discovery)
+        for hk in self._spec.get("heating_circuits", []):
+            self._build_hk_climate_device(hk)
+        for mod in self._spec.get("modules", []):
+            self._build_module_sensors(mod)
 
-                if "functions" not in device:
-                    _LOGGER.debug("Device %s has no functions, skipping.", device_id)
-                    continue
+        # Now look up all OIDs in one pass
+        ret = {"devices": self.devices, "oids": {}, "units": {}, "meta": {
+            "eco_default_duration_minutes": self._eco_default_duration_minutes
+        }}
 
-                # Filter climate controls (heating circuits), include ALL fctIds (e.g., 0, 1, ...)
-                climate_functions = [
-                    f for f in device["functions"]
-                    if f.get("fctType") == CLIMATE_FUNCTION_TYPE and f.get("lock") is False
-                ]
-
-                for cf in climate_functions:
-                    fct_id = f"/{str(cf['fctId'])}"
-                    f_name = cf.get("name", f"HK {cf['fctId']}")
-                    # make device_id unique per node and fctId
-                    device_id_with_fct = self.slugify(f"{self.host}{device_id}{fct_id}")
-
-                    # ---- Climate control (parent) device ----
-                    self.devices.append(
-                        {
-                            "id": device_id_with_fct,
-                            "name": f_name,
-                            "type": "climate",
-                            "prefix": device_id,
-                            "oids": [
-                                f"{device_id}{fct_id}/0/1/0",  # current room temperature
-                                f"{device_id}{fct_id}/1/1/0",  # target room temperature
-                                f"{device_id}{fct_id}/3/50/0", # mode
-                                f"{device_id}{fct_id}/2/10/0", # duration (custom temp)
-                                f"{device_id}{fct_id}/3/58/0", # comfort correction
-                            ],
-                            "device_id": device_id_with_fct,
-                            "device_name": f_name,
-                        }
-                    )
-
-                    # Register all OIDs needed for this fctId
-                    self.oids.update(
-                        [
-                            f"{device_id}{fct_id}/0/1/0",  # Current temperature
-                            f"{device_id}{fct_id}/1/1/0",  # Target temperature
-                            f"{device_id}{fct_id}/3/50/0", # Mode
-                            f"{device_id}{fct_id}/2/10/0", # Custom temp duration (min)
-                            f"{device_id}{fct_id}/0/0/0",  # Outside temperature
-                            f"{device_id}{fct_id}/3/58/0", # Comfort correction
-                            f"{device_id}{fct_id}/3/7/0",  # Current temp correction
-                        ]
-                    )
-
-                    # ---- Child entities ----
-
-                    # Current temperature (with correction)
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/0/1/0/with_corr"),
-                            "name": f"{f_name} Current Temperature",
-                            "type": "temperature",
-                            "correction_oid": f"{device_id}{fct_id}/3/58/0",
-                            "oid": f"{device_id}{fct_id}/0/1/0",
-                            "device_id": device_id_with_fct,
-                            "device_name": f_name,
-                        }
-                    )
-
-                    # Current temperature (raw)
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/0/1/0/raw"),
-                            "name": f"{f_name} Current Temperature real",
-                            "type": "temperature",
-                            "oid": f"{device_id}{fct_id}/0/1/0",
-                            "device_id": device_id_with_fct,
-                            "device_name": f_name,
-                        }
-                    )
-
-                    # Comfort Temperature correction
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/3/58/0"),
-                            "name": f"{f_name} Comfort Temperature Correction",
-                            "type": "sensor",
-                            "device_class": None,
-                            "state_class": None,
-                            "unit": "K",
-                            "oid": f"{device_id}{fct_id}/3/58/0",
-                            "device_id": device_id_with_fct,
-                            "device_name": f_name,
-                        }
-                    )
-
-                    # Current Temperature correction
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/3/7/0"),
-                            "name": f"{f_name} Current Temperature Correction",
-                            "type": "sensor",
-                            "device_class": None,
-                            "state_class": None,
-                            "unit": "K",
-                            "oid": f"{device_id}{fct_id}/3/7/0",
-                            "device_id": device_id_with_fct,
-                            "device_name": f_name,
-                        }
-                    )
-
-                    # Target temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/1/1/0"),
-                            "name": f"{f_name} Target Temperature",
-                            "type": "temperature",
-                            "correction_oid": f"{device_id}{fct_id}/3/58/0",
-                            "oid": f"{device_id}{fct_id}/1/1/0",
-                            "device_id": device_id_with_fct,
-                            "device_name": f_name,
-                        }
-                    )
-
-                    # Outside temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/0/0/0"),
-                            "name": f"{f_name} Outside Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id}{fct_id}/0/0/0",
-                            "device_id": device_id_with_fct,
-                            "device_name": f_name,
-                        }
-                    )
-
-                # Filter heaters
-                functions = list(
-                    filter(
-                        lambda f: (
-                            f["fctType"] == HEATER_FUNCTION_TYPE and f["lock"] is False
-                        ),
-                        device["functions"],
-                    )
-                )
-                if len(functions) > 0:
-                    fct_id = f"/{str(functions[0]['fctId'])}"
-
-                    self.oids.update(
-                        [
-                            # Heater power (percent)
-                            f"{device_id}{fct_id}/0/9/0",
-                            # Fumes temperature
-                            f"{device_id}{fct_id}/0/11/0",
-                            # Heater temperature
-                            f"{device_id}{fct_id}/0/7/0",
-                            # Combustion chamber temperature
-                            f"{device_id}{fct_id}/0/45/0",
-                            # Heater status
-                            f"{device_id}{fct_id}/2/1/0",
-                            # Pellet consumption
-                            f"{device_id}{fct_id}/23/100/0",
-                            f"{device_id}{fct_id}/23/103/0",
-                            # Cleaning
-                            f"{device_id}{fct_id}/20/61/0",
-                            f"{device_id}{fct_id}/20/62/0",
-                        ]
-                    )
-
-                    # Heater current power factor
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/0/9/0"
-                            ),
-                            "name": f"{functions[0]['name']} Power factor",
-                            "type": "sensor",
-                            "device_class": "power_factor",
-                            "state_class": None,
-                            "unit": "%",
-                            "oid": f"{device_id}{fct_id}/0/9/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-                    # Fumes temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/0/11/0"
-                            ),
-                            "name": f"{functions[0]['name']} Fumes Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id}{fct_id}/0/11/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-                    # Heater temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/0/7/0"
-                            ),
-                            "name": f"{functions[0]['name']} Heater Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id}{fct_id}/0/7/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-                    # Combustion chamber temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/0/45/0"
-                            ),
-                            "name": f"{functions[0]['name']} Combustion chamber Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id}{fct_id}/0/45/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-                    # Heater status
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/2/1/0"
-                            ),
-                            "name": f"{functions[0]['name']} Heater status",
-                            "options": [
-                                "Brûleur bloqué",
-                                "Autotest",
-                                "Eteindre gén. chaleur",
-                                "Veille",
-                                "Brûleur ARRET",
-                                "Prérinçage",
-                                "Phase d'allumage",
-                                "Stabilisation flamme",
-                                "Mode modulant",
-                                "Chaudière bloqué",
-                                "Veille temps différé",
-                                "Ventilateur Arrêté",
-                                "Porte de revêtement ouverte",
-                                "Allumage prêt",
-                                "Annuler phase d'allumage",
-                                "Préchauffage en cours",
-                            ],
-                            "type": "select",
-                            "oid": f"{device_id}{fct_id}/2/1/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-                    # Pellet consumption
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/23/100/0"
-                            ),
-                            "name": f"{functions[0]['name']} Pellet consumption",
-                            "type": "total",
-                            "oid": f"{device_id}{fct_id}/23/100/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-                    # Total pellet consumption
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/23/103/0"
-                            ),
-                            "name": f"{functions[0]['name']} Total Pellet consumption",
-                            "type": "total_increasing",
-                            "oid": f"{device_id}{fct_id}/23/103/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-
-                    # Running time until stage 1 cleaning
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/20/61/0"
-                            ),
-                            "name": f"{functions[0]['name']} Running time until stage 1 cleaning",
-                            "type": "sensor",
-                            "device_class": "duration",
-                            "state_class": None,
-                            "unit": "h",
-                            "oid": f"{device_id}{fct_id}/20/61/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-
-                    # Running time until stage 2 cleaning
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/20/62/0"
-                            ),
-                            "name": f"{functions[0]['name']} Running time until stage 2 cleaning",
-                            "type": "sensor",
-                            "device_class": "duration",
-                            "state_class": None,
-                            "unit": "h",
-                            "oid": f"{device_id}{fct_id}/20/62/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
-                        }
-                    )
-
-        ret = {
-            "devices": self.devices,
-            "oids": {},
-        }
-
-        # Read all found OIDs
-        for oid in self.oids:
-            try:
-                json = await self.fetch(oid)
-                if "value" in json and json["value"] != "-.-":
-                    ret["oids"][oid] = json["value"]
-                else:
-                    ret["oids"][oid] = None
-                    _LOGGER.debug("Invalid or missing value for OID %s: %s", oid, json)
-            except Exception as e:
+        for oid in sorted(self._oids_to_fetch):
+            js = await self._lookup(oid)
+            if not js or "value" not in js:
                 ret["oids"][oid] = None
-                _LOGGER.error("Error while fetching OID %s: %s", oid, str(e))
+                continue
+            val = js.get("value")
+            unit = js.get("unit")
+            ret["units"][oid] = unit
+            if val in self._unknown_values:
+                _LOGGER.debug("Invalid or missing value for OID %s: %s", oid, js)
+                ret["oids"][oid] = None
+            else:
+                ret["oids"][oid] = val
 
         return ret
